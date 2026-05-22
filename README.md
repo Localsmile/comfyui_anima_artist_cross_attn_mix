@@ -1,0 +1,2 @@
+# comfyui_anima_artist_cross_attn_mix
+comfyui_anima_artist_cross_attn_mix
