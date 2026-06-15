@@ -21,7 +21,7 @@ Wire `model` and `clip` in, then connect the `model` and `conditioning` outputs
 to your sampler. Write artist tags with an `@` prefix in the text box:
 
 ```
-1girl, masterpiece, @(artist_a:2.0), @(artist_b:2.0), @artist_c
+masterpiece, 1girl, @(artist_a:0.8), @(artist_b:2.0), @artist_c
 ```
 
 ### Artist tag syntax
