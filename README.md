@@ -31,8 +31,6 @@ masterpiece, 1girl, @(artist_a:0.8), @(artist_b:2.0), @artist_c
 - `(@artist:1.5)` - alternative explicit-weight form
 - `@(artist:-2)` - negative weight subtracts that style
 
-Anima generally needs per-artist weights of **2.0+**.
-
 ## NegPiP
 
 Non-artist tags with a negative weight are subtracted (NegPiP), with no extra
