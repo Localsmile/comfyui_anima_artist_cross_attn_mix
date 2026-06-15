@@ -1,4 +1,5 @@
 import re
+
 import torch
 from einops import rearrange
 
@@ -155,14 +156,30 @@ class _MixedCrossAttn(torch.nn.Module):
             q, k, v, transformer_options=transformer_options)
 
 
-def _build_kv_cache(blocks, adapter_outs):
+def _expand_sign_mask(sign, adapter_out):
+    if sign is None:
+        return None
+    T = adapter_out.shape[1]
+    L = sign.shape[1]
+    mask = adapter_out.new_ones((sign.shape[0], T, 1))
+    n = min(L, T)
+    mask[:, :n, :] = sign[:, :n, :].to(mask.dtype)
+    if bool(torch.all(mask == 1)):
+        return None
+    return mask
+
+
+def _build_kv_cache(blocks, adapter_outs, sign_masks=None):
+    if sign_masks is None:
+        sign_masks = [None] * len(adapter_outs)
     cache = []
     for block in blocks:
         attn = block.cross_attn
         per_block = []
-        for adapter_out in adapter_outs:
+        for adapter_out, sign in zip(adapter_outs, sign_masks):
+            ctx_v = adapter_out if sign is None else adapter_out * sign
             k = attn.k_proj(adapter_out)
-            v = attn.v_proj(adapter_out)
+            v = attn.v_proj(ctx_v)
             k = rearrange(k, "b ... (h d) -> b ... h d",
                           h=attn.n_heads, d=attn.head_dim)
             v = rearrange(v, "b ... (h d) -> b ... h d",
@@ -189,6 +206,17 @@ class AnimaArtistCrossAttnMix:
     RETURN_NAMES = ("model", "conditioning")
     FUNCTION = "process"
     CATEGORY = "conditioning/anima"
+    DESCRIPTION = (
+        "Blend multiple artist tags for the Anima model so their styles mix "
+        "evenly instead of one artist dominating the others.\n\n"
+        "Tag artists in the text box with @name or @(name:2.0) (Anima usually "
+        "wants weights of 2.0+). Each artist is encoded separately and the "
+        "cross-attention outputs are blended by weight.\n\n"
+        "Built-in NegPiP: any non-artist tag with a negative weight, e.g. "
+        "(speech bubble:-1.1), is subtracted - no ComfyUI-ppm or extra node "
+        "needed.\n\n"
+        "Wire both outputs (model + conditioning) into your sampler."
+    )
 
     def process(self, model, clip, text):
         spans = parse_artists(text)
@@ -235,6 +263,7 @@ class AnimaArtistCrossAttnMix:
 
             if cache_state["kv_cache"] is None:
                 adapter_outs = []
+                sign_masks = []
                 for p in payload:
                     qwen = p["qwen3_hidden"].to(device=device, dtype=dtype)
                     t5_ids = p["t5xxl_ids"]
@@ -243,14 +272,20 @@ class AnimaArtistCrossAttnMix:
                         t5_ids = t5_ids.to(device=device)
                         if t5_ids.dim() == 1:
                             t5_ids = t5_ids.unsqueeze(0)
+                    sign = None
                     if t5_w is not None:
                         t5_w = t5_w.to(device=device, dtype=dtype)
                         if t5_w.dim() == 1:
                             t5_w = t5_w.view(1, -1, 1)
-                    adapter_outs.append(
-                        diffusion_model.preprocess_text_embeds(qwen, t5_ids, t5_w))
+                        if t5_ids is not None:
+                            sign = torch.sign(t5_w)
+                            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                            t5_w = t5_w.abs()
+                    adapter_out = diffusion_model.preprocess_text_embeds(qwen, t5_ids, t5_w)
+                    adapter_outs.append(adapter_out)
+                    sign_masks.append(_expand_sign_mask(sign, adapter_out))
                 cache_state["kv_cache"] = _build_kv_cache(
-                    diffusion_model.blocks, adapter_outs)
+                    diffusion_model.blocks, adapter_outs, sign_masks)
 
             kv_cache = cache_state["kv_cache"]
             blocks = diffusion_model.blocks
