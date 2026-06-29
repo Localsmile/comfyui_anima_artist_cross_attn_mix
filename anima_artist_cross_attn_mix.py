@@ -90,7 +90,7 @@ def to_native_text(text, spans):
 class _MixedCrossAttn(torch.nn.Module):
     def __init__(self, orig_attn, kv_cache_per_artist, weights):
         super().__init__()
-        self.orig = orig_attn
+        object.__setattr__(self, "orig", orig_attn)
         self.kv_cache_per_artist = kv_cache_per_artist
         self.weights = weights
 
@@ -186,9 +186,90 @@ def _build_kv_cache(blocks, adapter_outs, sign_masks=None):
                           h=attn.n_heads, d=attn.head_dim)
             k = attn.k_norm(k)
             v = attn.v_norm(v)
-            per_block.append((k, v))
+            per_block.append((k.detach(), v.detach()))
         cache.append(per_block)
     return cache
+
+
+def _frozen_tensor(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    return value
+
+
+def _cache_key(diffusion_model, device, dtype):
+    return (id(diffusion_model), device.type, device.index, dtype)
+
+
+class _AnimaCrossAttnMixWrapper:
+    def __init__(self, payload, weights):
+        self.payload = tuple(payload)
+        self.weights = tuple(float(w) for w in weights)
+        self.kv_cache_by_key = {}
+
+    def cleanup(self, **_kwargs):
+        self.kv_cache_by_key.clear()
+
+    def __call__(self, apply_model, args):
+        input_x = args["input"]
+        timestep_ = args["timestep"]
+        c = args["c"]
+
+        base_model = getattr(apply_model, "__self__", None)
+        diffusion_model = getattr(base_model, "diffusion_model", None)
+        if diffusion_model is None or not hasattr(diffusion_model, "blocks"):
+            raise RuntimeError(
+                "AnimaArtistCrossAttnMix expected a ComfyUI model with "
+                "diffusion_model.blocks."
+            )
+
+        device = input_x.device
+        dtype = input_x.dtype
+        key = _cache_key(diffusion_model, device, dtype)
+        kv_cache = self.kv_cache_by_key.get(key)
+        if kv_cache is None:
+            kv_cache = self._build_cache(diffusion_model, device, dtype)
+            self.kv_cache_by_key[key] = kv_cache
+
+        blocks = diffusion_model.blocks
+        originals = [block.cross_attn for block in blocks]
+        for idx, block in enumerate(blocks):
+            block.cross_attn = _MixedCrossAttn(
+                originals[idx], kv_cache[idx], self.weights)
+
+        try:
+            return apply_model(input_x, timestep_, **c)
+        finally:
+            for block, orig in zip(blocks, originals):
+                block.cross_attn = orig
+
+    def _build_cache(self, diffusion_model, device, dtype):
+        adapter_outs = []
+        sign_masks = []
+        with torch.no_grad():
+            for p in self.payload:
+                qwen = p["qwen3_hidden"].to(device=device, dtype=dtype)
+                t5_ids = p["t5xxl_ids"]
+                t5_w = p["t5xxl_weights"]
+                if t5_ids is not None:
+                    t5_ids = t5_ids.to(device=device)
+                    if t5_ids.dim() == 1:
+                        t5_ids = t5_ids.unsqueeze(0)
+                sign = None
+                if t5_w is not None:
+                    t5_w = t5_w.to(device=device, dtype=dtype)
+                    if t5_w.dim() == 1:
+                        t5_w = t5_w.view(1, -1, 1)
+                    if t5_ids is not None:
+                        sign = torch.sign(t5_w)
+                        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                        t5_w = t5_w.abs()
+                adapter_out = diffusion_model.preprocess_text_embeds(qwen, t5_ids, t5_w)
+                adapter_outs.append(adapter_out.detach())
+                sign_masks.append(_expand_sign_mask(sign, adapter_out))
+            return _build_kv_cache(diffusion_model.blocks, adapter_outs, sign_masks)
 
 
 class AnimaArtistCrossAttnMix:
@@ -242,65 +323,15 @@ class AnimaArtistCrossAttnMix:
 
         payload = [
             {
-                "qwen3_hidden": tensor,
-                "t5xxl_ids": ctx.get("t5xxl_ids", None),
-                "t5xxl_weights": ctx.get("t5xxl_weights", None),
+                "qwen3_hidden": _frozen_tensor(tensor),
+                "t5xxl_ids": _frozen_tensor(ctx.get("t5xxl_ids", None)),
+                "t5xxl_weights": _frozen_tensor(ctx.get("t5xxl_weights", None)),
             }
             for tensor, ctx in ([bare_cond] + per_artist_conds)
         ]
 
         m_patched = model.clone()
-        cache_state = {"kv_cache": None}
-
-        def model_wrapper(apply_model, args):
-            input_x = args["input"]
-            timestep_ = args["timestep"]
-            c = args["c"]
-
-            diffusion_model = m_patched.model.diffusion_model
-            device = input_x.device
-            dtype = input_x.dtype
-
-            if cache_state["kv_cache"] is None:
-                adapter_outs = []
-                sign_masks = []
-                for p in payload:
-                    qwen = p["qwen3_hidden"].to(device=device, dtype=dtype)
-                    t5_ids = p["t5xxl_ids"]
-                    t5_w = p["t5xxl_weights"]
-                    if t5_ids is not None:
-                        t5_ids = t5_ids.to(device=device)
-                        if t5_ids.dim() == 1:
-                            t5_ids = t5_ids.unsqueeze(0)
-                    sign = None
-                    if t5_w is not None:
-                        t5_w = t5_w.to(device=device, dtype=dtype)
-                        if t5_w.dim() == 1:
-                            t5_w = t5_w.view(1, -1, 1)
-                        if t5_ids is not None:
-                            sign = torch.sign(t5_w)
-                            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-                            t5_w = t5_w.abs()
-                    adapter_out = diffusion_model.preprocess_text_embeds(qwen, t5_ids, t5_w)
-                    adapter_outs.append(adapter_out)
-                    sign_masks.append(_expand_sign_mask(sign, adapter_out))
-                cache_state["kv_cache"] = _build_kv_cache(
-                    diffusion_model.blocks, adapter_outs, sign_masks)
-
-            kv_cache = cache_state["kv_cache"]
-            blocks = diffusion_model.blocks
-
-            originals = [block.cross_attn for block in blocks]
-            for idx, block in enumerate(blocks):
-                block.cross_attn = _MixedCrossAttn(
-                    originals[idx], kv_cache[idx], weights)
-
-            try:
-                return apply_model(input_x, timestep_, **c)
-            finally:
-                for block, orig in zip(blocks, originals):
-                    block.cross_attn = orig
-
+        model_wrapper = _AnimaCrossAttnMixWrapper(payload, weights)
         m_patched.set_model_unet_function_wrapper(model_wrapper)
         return (m_patched, [[base_tensor, base_ctx]])
 
