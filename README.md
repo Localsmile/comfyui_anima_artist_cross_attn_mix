@@ -31,6 +31,24 @@ masterpiece, 1girl, @(artist_a:0.8), @(artist_b:2.0), @artist_c
 - `(@artist:1.5)` - alternative explicit-weight form
 - `@(artist:-2)` - negative weight subtracts that style
 
+### Mix settings
+
+- `mix_mode`
+  - `legacy` (default): the original mix, where each weight extrapolates the
+    style (artists usually want 2.0+).
+  - `normalized`: artist weights are **ratios**. `@(a:2), @(b:1)` mixes a and
+    b 2:1, so stacking many artists stays stable instead of producing
+    artifacts. A negative artist is subtracted relative to the total positive
+    weight. Recommended when you stack many artists or use negative artists.
+- `strength`: overall artist style strength in `normalized` mode. `1.0` is a
+  plain mix of the artists; raise it (e.g. `1.5`) for a stronger style.
+- `start_percent` / `end_percent`: the part of sampling where the artist mix
+  applies. Steps outside it use the prompt without artist tags; for example,
+  `start_percent = 0.2` lets the composition settle before the style comes in.
+
+Workflows saved with older versions load with the defaults above and keep
+the original behavior.
+
 ## NegPiP
 
 Non-artist tags with a negative weight are subtracted (NegPiP), with no extra
@@ -39,6 +57,16 @@ node or dependency required:
 ```
 1girl, @(artist_a:2.0), (speech bubble:-1.1), (signature:-1.3)
 ```
+
+`negpip_mode` chooses how negative tags are applied:
+
+- `legacy` (default): the negative tag's own tokens are flipped inside the
+  prompt. This is the original behavior.
+- `branch`: each negative tag is encoded on its own and its effect is
+  subtracted from the result, scaled by the weight. The rest of the prompt
+  never sees the negative concept, which avoids the tug-of-war that can cause
+  odd results. Each negative tag costs one extra text encode and one extra
+  attention pass per block. It also works when the prompt has no artist tags.
 
 ## License
 
