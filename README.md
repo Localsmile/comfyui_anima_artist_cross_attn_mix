@@ -34,14 +34,16 @@ masterpiece, 1girl, @(artist_a:0.8), @(artist_b:2.0), @artist_c
 ### Mix settings
 
 - `mix_mode`
-  - `legacy` (default): the original mix, where each weight extrapolates the
-    style (artists usually want 2.0+).
-  - `normalized`: artist weights are **ratios**. `@(a:2), @(b:1)` mixes a and
-    b 2:1, so stacking many artists stays stable instead of producing
-    artifacts. A negative artist is subtracted relative to the total positive
-    weight. Recommended when you stack many artists or use negative artists.
-- `strength`: overall artist style strength in `normalized` mode. `1.0` is a
-  plain mix of the artists; raise it (e.g. `1.5`) for a stronger style.
+  - `legacy` (default): the original mix. Each stacked artist adds its full
+    weight (artists usually want 2.0+), so the push grows with every tag:
+    six artists at 2.0 already break the image.
+  - `normalized`: identical to legacy for a single artist, but the stacked
+    total is divided by √(number of artists). Three artists look like legacy
+    without its color fringing, and six or ten artists still produce a clean
+    image. Weights mean the same as in legacy. Recommended when you stack
+    artists.
+- `strength`: style multiplier in `normalized` mode. `1.0` matches legacy for
+  a single artist; lower it if a very large stack looks overcooked.
 - `start_percent` / `end_percent`: the part of sampling where the artist mix
   applies. Steps outside it use the prompt without artist tags; for example,
   `start_percent = 0.2` lets the composition settle before the style comes in.

@@ -1,3 +1,4 @@
+import math
 import re
 
 import torch
@@ -112,9 +113,10 @@ def to_native_text(text, spans):
 MIX_MODES = ["legacy", "normalized"]
 NEGPIP_MODES = ["legacy", "branch"]
 
-# Per-token cap on |mixed output| / |positive mix| (L1), as in Normalized
-# Attention Guidance. Only bites when strength > 1 or negative artists push the
-# output far outside the range the model was trained on.
+# Per-token cap on |output| / |output before subtraction| (L1), as in
+# Normalized Attention Guidance. Applied only after subtracting negative
+# artists or branch NegPiP tags, so they can't push tokens far outside the
+# range the model was trained on.
 NORM_GUARD_TAU = 2.0
 _EPS = 1e-6
 
@@ -234,41 +236,44 @@ class _MixedCrossAttn(torch.nn.Module):
         return _norm_guard(z, mixed)
 
     def _mix_normalized(self, q, bare, transformer_options):
-        # Positive weights are ratios: the positive artists form a convex mix,
-        # so stacking more tags never extrapolates. `strength` alone scales the
-        # style away from the bare prompt. Negative artists are subtracted
-        # relative to the positive total, after removing the part of their
-        # delta that points along the positive style (the shared "has an
-        # artist tag" direction), so they don't wash out the positive mix.
+        # Legacy adds w_i * (artist_i - bare) for every artist, so N stacked
+        # artists push the output N times as far and the image falls apart.
+        # Here the sum is divided by sqrt(N): one artist matches legacy
+        # exactly, and stacking grows only as sqrt(N). Negative artists are
+        # subtracted the same way, after removing the part of their delta that
+        # points along the positive style (the shared "has an artist tag"
+        # direction), so they don't wash out the positive mix.
         bare = bare.float()
-        pos_total = sum(w for w in self.weights if w > 0)
-
-        z_pos = bare if pos_total <= 0 else torch.zeros_like(bare)
+        d_pos = torch.zeros_like(bare)
+        n_pos = 0
         negatives = []
         for kv, w in zip(self.kv_cache_per_artist[1:], self.weights):
             if w == 0:
                 continue
-            a = self._attn(q, kv, transformer_options).float()
+            d = self._attn(q, kv, transformer_options).float() - bare
             if w > 0:
-                z_pos = z_pos + (w / pos_total) * a
+                d_pos = d_pos + w * d
+                n_pos += 1
             else:
-                negatives.append((a, -w))
+                negatives.append((d, -w))
 
-        d_pos = z_pos - bare
-        z = bare + self.strength * d_pos
+        if n_pos:
+            d_pos = d_pos * (self.strength / math.sqrt(n_pos))
+        z = bare + d_pos
+        if not negatives:
+            return z
 
-        if negatives:
-            heads = (*bare.shape[:-1], self.orig.n_heads, -1)
-            d_pos_h = d_pos.view(heads)
-            d_pos_sq = (d_pos_h * d_pos_h).sum(dim=-1, keepdim=True) + _EPS
-            neg_scale = pos_total if pos_total > 0 else 1.0
-            for a, w_abs in negatives:
-                d = (a - bare).view(heads)
-                coef = ((d * d_pos_h).sum(dim=-1, keepdim=True) / d_pos_sq).clamp(min=0)
-                d = (d - coef * d_pos_h).reshape(bare.shape)
-                z = z - self.strength * (w_abs / neg_scale) * d
-
-        return _norm_guard(z, z_pos)
+        heads = (*bare.shape[:-1], self.orig.n_heads, -1)
+        d_pos_h = d_pos.view(heads)
+        d_pos_sq = (d_pos_h * d_pos_h).sum(dim=-1, keepdim=True) + _EPS
+        neg_scale = self.strength / math.sqrt(len(negatives))
+        z_neg = z
+        for d, w_abs in negatives:
+            d = d.view(heads)
+            coef = ((d * d_pos_h).sum(dim=-1, keepdim=True) / d_pos_sq).clamp(min=0)
+            d = (d - coef * d_pos_h).reshape(bare.shape)
+            z_neg = z_neg - neg_scale * w_abs * d
+        return _norm_guard(z_neg, z)
 
     def _standard(self, q, k_in, v_in, transformer_options):
         k = self.orig.k_proj(k_in)
@@ -446,14 +451,15 @@ class AnimaArtistCrossAttnMix:
                 "text": ("STRING", {"multiline": True}),
                 "mix_mode": (MIX_MODES, {
                     "default": "legacy",
-                    "tooltip": "legacy: the original extrapolating mix. "
-                               "normalized: artist weights are ratios, so stacking "
-                               "many tags stays stable and avoids artifacts.",
+                    "tooltip": "legacy: the original mix; every stacked artist adds "
+                               "its full weight, so many artists break the image. "
+                               "normalized: same as legacy for one artist, but "
+                               "stacking N artists grows as sqrt(N) instead of N.",
                 }),
                 "strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05,
-                    "tooltip": "Overall artist style strength (normalized mode). "
-                               "Values above 1 push the style further.",
+                    "tooltip": "Artist style multiplier in normalized mode. 1.0 "
+                               "matches legacy for a single artist.",
                 }),
                 "start_percent": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -485,11 +491,12 @@ class AnimaArtistCrossAttnMix:
         "evenly instead of one artist dominating the others.\n\n"
         "Tag artists in the text box with @name or @(name:2.0). Each artist is "
         "encoded separately and the cross-attention outputs are blended.\n\n"
-        "legacy mode (default): the original mix, where weights extrapolate "
-        "and artists usually want 2.0+. normalized mode: weights are ratios "
-        "between artists (@(a:2), @(b:1) mixes 2:1) and strength sets the "
-        "overall style strength, which stays stable with many stacked tags. "
-        "A negative artist is subtracted relative to the positive total.\n\n"
+        "Artists usually want weights of 2.0+. legacy mode (default): the "
+        "original mix, where each stacked artist adds its full weight, so "
+        "many artists break the image. normalized mode: identical to legacy "
+        "for one artist, but the stacked total is divided by sqrt(number of "
+        "artists), so heavy stacking keeps the legacy look without breaking. "
+        "strength multiplies the style.\n\n"
         "Built-in NegPiP: any non-artist tag with a negative weight, e.g. "
         "(speech bubble:-1.1), is subtracted - no ComfyUI-ppm or extra node "
         "needed. negpip_mode=branch encodes each negative tag separately and "
