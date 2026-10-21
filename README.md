@@ -68,6 +68,12 @@ node or dependency required:
   odd results. Each negative tag costs one extra text encode and one extra
   attention pass per block. It also works when the prompt has no artist tags.
 
+## Compatibility
+
+Works with Anima ControlNet-LLLite, both ComfyUI's native **Apply Anima
+LLLite** node and the sd-scripts custom node, in either order. Model-wrapper
+nodes applied before this one keep working.
+
 ## License
 
 MIT

@@ -147,6 +147,22 @@ class _MixedCrossAttn(torch.nn.Module):
             transformer_options = {}
         cou = transformer_options.get("cond_or_uncond", None)
 
+        # Run attn2 patches like the stock cross-attn does (e.g. native Anima
+        # LLLite edits the query input here). Patched k/v only reach the
+        # uncond path; the mixed path uses its cached per-branch K/V.
+        k_in = v_in = context
+        attn2_patches = transformer_options.get("patches", {}).get("attn2_patch", [])
+        if attn2_patches:
+            extra_options = transformer_options.copy()
+            extra_options["n_heads"] = self.orig.n_heads
+            extra_options["dim_head"] = self.orig.head_dim
+            for patch in attn2_patches:
+                out = patch(x, k_in, v_in, pe=rope_emb, attn_mask=None,
+                            extra_options=extra_options)
+                x = out.get("q", x)
+                k_in = out.get("k", k_in)
+                v_in = out.get("v", v_in)
+
         q = self.orig.q_proj(x)
         q = rearrange(q, "b ... (h d) -> b ... h d",
                       h=self.orig.n_heads, d=self.orig.head_dim)
@@ -161,8 +177,9 @@ class _MixedCrossAttn(torch.nn.Module):
                 if cu == 0:
                     chunks.append(self._mix(q_chunk, transformer_options))
                 else:
-                    ctx_chunk = context[i * per_chunk:(i + 1) * per_chunk]
-                    chunks.append(self._standard(q_chunk, ctx_chunk, transformer_options))
+                    sl = slice(i * per_chunk, (i + 1) * per_chunk)
+                    chunks.append(self._standard(q_chunk, k_in[sl], v_in[sl],
+                                                 transformer_options))
             out = torch.cat(chunks, dim=0)
         else:
             out = self._mix(q, transformer_options)
@@ -253,9 +270,9 @@ class _MixedCrossAttn(torch.nn.Module):
 
         return _norm_guard(z, z_pos)
 
-    def _standard(self, q, context, transformer_options):
-        k = self.orig.k_proj(context)
-        v = self.orig.v_proj(context)
+    def _standard(self, q, k_in, v_in, transformer_options):
+        k = self.orig.k_proj(k_in)
+        v = self.orig.v_proj(v_in)
         k = rearrange(k, "b ... (h d) -> b ... h d",
                       h=self.orig.n_heads, d=self.orig.head_dim)
         v = rearrange(v, "b ... (h d) -> b ... h d",
@@ -322,8 +339,11 @@ def _compute_dtype(base_model, fallback):
 
 class _AnimaCrossAttnMixWrapper:
     def __init__(self, payload, weights, neg_weights=(), mode="legacy",
-                 strength=1.0, sigma_range=None):
+                 strength=1.0, sigma_range=None, inner_wrapper=None):
         self.payload = tuple(payload)
+        # model_function_wrapper is a single slot; keep whatever was there
+        # (e.g. the sd-scripts Anima LLLite node) and call it inside ours.
+        self.inner_wrapper = inner_wrapper
         self.weights = tuple(float(w) for w in weights)
         self.neg_weights = tuple(float(w) for w in neg_weights)
         self.mode = mode
@@ -338,8 +358,17 @@ class _AnimaCrossAttnMixWrapper:
         sigma = float(timestep.max()) if torch.is_tensor(timestep) else float(timestep)
         return end_sigma <= sigma <= start_sigma
 
-    def cleanup(self, **_kwargs):
+    def cleanup(self, **kwargs):
         self.kv_cache_by_key.clear()
+        inner_cleanup = getattr(self.inner_wrapper, "cleanup", None)
+        if callable(inner_cleanup):
+            inner_cleanup(**kwargs)
+
+    def _call_next(self, apply_model, input_x, timestep_, c):
+        if self.inner_wrapper is not None:
+            return self.inner_wrapper(
+                apply_model, {"input": input_x, "timestep": timestep_, "c": c})
+        return apply_model(input_x, timestep_, **c)
 
     def __call__(self, apply_model, args):
         input_x = args["input"]
@@ -375,7 +404,7 @@ class _AnimaCrossAttnMixWrapper:
                 strength=self.strength, artists_active=artists_active)
 
         try:
-            return apply_model(input_x, timestep_, **c)
+            return self._call_next(apply_model, input_x, timestep_, c)
         finally:
             for block, orig in zip(blocks, originals):
                 block.cross_attn = orig
@@ -519,7 +548,8 @@ class AnimaArtistCrossAttnMix:
         m_patched = model.clone()
         model_wrapper = _AnimaCrossAttnMixWrapper(
             payload, weights, neg_weights=neg_weights, mode=mix_mode,
-            strength=strength, sigma_range=sigma_range)
+            strength=strength, sigma_range=sigma_range,
+            inner_wrapper=m_patched.model_options.get("model_function_wrapper"))
         m_patched.set_model_unet_function_wrapper(model_wrapper)
         return (m_patched, [[base_tensor, base_ctx]])
 
